@@ -9,7 +9,7 @@ namespace hcd::profile {
 
 enum FunctionId : size_t {
     DomainGet, AssemblyImage, ImageName, ClassCount, ImageClass, ClassMethods,
-    ThreadCurrent, ThreadAttach, ThreadDetach, UnderlyingImage, FindAotImage, FunctionCount
+    ThreadCurrent, ThreadAttach, ThreadDetach, UnderlyingImage, FindAotImage, ResolveIcall, FunctionCount
 };
 
 struct FunctionSpec {
@@ -23,7 +23,7 @@ inline constexpr FunctionSpec kFunctions[FunctionCount] = {
     {"il2cpp_image_get_class", true}, {"il2cpp_class_get_methods", true},
     {"il2cpp_thread_current", true}, {"il2cpp_thread_attach", true},
     {"il2cpp_thread_detach", true}, {"GetUnderlyingInterpreterImage", false},
-    {"FindImageByAssembly", false}
+    {"FindImageByAssembly", false}, {"il2cpp_resolve_icall", true}
 };
 
 struct Function {
@@ -43,6 +43,7 @@ struct Layout {
     size_t image_raw = 0, image_pdb = 0, raw_data = 0, raw_length = 0, raw_end = 0;
     size_t hot_il2cpp_image = 0, hot_index = 0, aot_target_assembly = 0;
     size_t il2cpp_image_assembly = 0, il2cpp_image_token = 0, assembly_token = 0;
+    size_t assembly_image = 0, il2cpp_image_name = 0;
     size_t class_image = 0, class_rank = 0, method_class = 0;
 };
 
@@ -59,7 +60,7 @@ inline constexpr LayoutSpec kLayouts[] = {
     {"il2cpp_image_assembly", &Layout::il2cpp_image_assembly, 8},
     {"il2cpp_image_token", &Layout::il2cpp_image_token, 4}, {"assembly_token", &Layout::assembly_token, 4},
     {"class_image", &Layout::class_image, 8}, {"class_rank", &Layout::class_rank, 1},
-    {"method_class", &Layout::method_class, 8}
+    {"method_class", &Layout::method_class, 8}, {"assembly_image", &Layout::assembly_image, 8}
 };
 
 struct RuntimeProfile {
@@ -75,6 +76,9 @@ struct RuntimeProfile {
 inline constexpr size_t kHotSlots = 1024;
 inline constexpr size_t kMaxAssemblies = 65536;
 inline constexpr size_t kMaxClasses = 1048576;
+// Bounded object-prefix inspection, never a process-wide heap scan.
+inline constexpr size_t kImageAssociationBytes = 512;
+inline constexpr size_t kRawOwnerBytes = 128;
 
 inline bool interpreter_token(uint32_t token) {
     return token != UINT32_MAX && (token & 0xF0000000u) != 0;

@@ -345,14 +345,15 @@ bool valid_utf8(const std::string& text) {
 bool read_tables(const Metadata& metadata, uint32_t entry_token, FileInfo& info) {
     const Bytes tables = metadata.streams[Tables].bytes;
     if (!tables.contains(0, 24)) return fail(info, "Truncated metadata tables header");
-    if (tables.u32(0) != 0 || tables.u8(4) != 2 || tables.u8(5) != 0 || tables.u8(7) != 1) {
+    // Cecil uses Reserved2=0x0a; it does not change the table layout.
+    if (tables.u32(0) != 0 || tables.u8(4) != 2 || tables.u8(5) != 0) {
         return fail(info, "Unsupported metadata tables header layout");
     }
     const uint8_t heap_flags = tables.u8(6);
     if ((heap_flags & ~7u) != 0) return fail(info, "Unsupported metadata heap-size flags");
     const uint64_t valid = tables.u64(8);
-    const uint64_t sorted = tables.u64(16);
-    if (((valid | sorted) & ~kTableMask) != 0) return fail(info, "Unsupported metadata table outside 0..44");
+    // Only Valid describes stored tables; Sorted can also name absent tables.
+    if ((valid & ~kTableMask) != 0) return fail(info, "Unsupported metadata table outside 0..44");
     if (!metadata.uncompressed && (valid & (kPointerMask | kEncMask)) != 0) {
         return fail(info, "Pointer or EnC tables require an uncompressed metadata stream");
     }

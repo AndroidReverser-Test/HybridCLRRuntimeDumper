@@ -2,6 +2,7 @@
 #include "format.h"
 #include "internal.h"
 #include "profile.h"
+#include "discovery.h"
 
 #include <algorithm>
 #include <array>
@@ -49,6 +50,7 @@ struct Api {
     void (*thread_detach)(Il2CppThread*) = nullptr;
     void* (*underlying_image)(const MethodInfo*) = nullptr;
     void* (*find_aot_image)(const Il2CppAssembly*) = nullptr;
+    void* (*resolve_icall)(const char*) = nullptr;
 };
 
 template<typename T> T pointer(uintptr_t value) { return reinterpret_cast<T>(value); }
@@ -90,6 +92,7 @@ struct Raw {
 
 struct Blob {
     Raw raw;
+    profile::Layout layout;
     std::string status = "NOT_ATTEMPTED", reason, filename;
     uint64_t written = 0;
     bool coverage_complete = false;
@@ -105,6 +108,9 @@ struct Candidate {
     uintptr_t hybrid_image = 0, assembly = 0, il2cpp_image = 0, method = 0;
     uint32_t registry_index = UINT32_MAX;
     bool query_confirmed = false, registered = false, association_verified = false;
+    bool native_name_matches_metadata = false;
+    std::string association_route, private_query_status = "NOT_REQUESTED";
+    profile::Layout layout;
     std::string error, status = "PENDING_INITIALIZATION";
     size_t duplicate_of = 0;
     Blob dll, pdb;
@@ -114,9 +120,12 @@ struct Report {
     std::string directory, started, error;
     Module module;
     std::vector<Binding> bindings;
+    std::vector<DiscoveryEvidence> discovery_evidence;
+    bool discovery_evidence_unchanged = false;
     std::vector<Candidate> candidates;
     Registries before;
-    bool registry_snapshot_taken = false, snapshot_unchanged = false, complete = false, cancelled = false;
+    bool registry_snapshot_taken = false, snapshot_unchanged = false, all_registered_inputs_exported = false;
+    bool complete = false, cancelled = false;
     int result = HYBRIDCLR_DUMP_ERROR;
 };
 
@@ -151,20 +160,37 @@ uintptr_t bind(const profile::FunctionSpec& spec, const profile::Function& funct
     return record.address;
 }
 
+uintptr_t bind_export(const profile::FunctionSpec& spec, const Memory& memory,
+                      const Module& module, std::vector<Binding>& bindings) {
+    uintptr_t location = module.symbol(memory, spec.name);
+    if (!location || (location & 3) || !module.contains(location, 4, true) || !memory.executable(location, 4))
+        throw std::runtime_error(std::string("Auto discovery requires a real module export: ") + spec.name);
+    uint32_t word = 0;
+    if (!memory.value(location, word)) throw std::runtime_error("Unreadable exported API entry");
+    bindings.push_back({spec.name, "ELF_DYNAMIC_SYMBOL_ABI", location, location - module.bias,
+                        sizeof(word), "", sha256(&word, sizeof(word))});
+    return location;
+}
+
 Api bind_api(const Config& config, const Memory& memory, const Module& module, std::vector<Binding>& bindings) {
     Api api;
     auto resolve = [&](profile::FunctionId id) {
-        return bind(profile::kFunctions[id], config.profile.functions[id], memory, module, bindings);
+        return config.automatic_discovery ? bind_export(profile::kFunctions[id], memory, module, bindings) :
+            bind(profile::kFunctions[id], config.profile.functions[id], memory, module, bindings);
     };
     api.domain_get = pointer<decltype(api.domain_get)>(resolve(profile::DomainGet));
     api.assembly_image = pointer<decltype(api.assembly_image)>(resolve(profile::AssemblyImage));
     api.image_name = pointer<decltype(api.image_name)>(resolve(profile::ImageName));
-    api.class_count = pointer<decltype(api.class_count)>(resolve(profile::ClassCount));
-    api.image_class = pointer<decltype(api.image_class)>(resolve(profile::ImageClass));
-    api.class_methods = pointer<decltype(api.class_methods)>(resolve(profile::ClassMethods));
     api.thread_current = pointer<decltype(api.thread_current)>(resolve(profile::ThreadCurrent));
     api.thread_attach = pointer<decltype(api.thread_attach)>(resolve(profile::ThreadAttach));
     api.thread_detach = pointer<decltype(api.thread_detach)>(resolve(profile::ThreadDetach));
+    if (config.automatic_discovery) {
+        api.resolve_icall = pointer<decltype(api.resolve_icall)>(resolve(profile::ResolveIcall));
+        return api;
+    }
+    api.class_count = pointer<decltype(api.class_count)>(resolve(profile::ClassCount));
+    api.image_class = pointer<decltype(api.image_class)>(resolve(profile::ImageClass));
+    api.class_methods = pointer<decltype(api.class_methods)>(resolve(profile::ClassMethods));
     api.underlying_image = pointer<decltype(api.underlying_image)>(resolve(profile::UnderlyingImage));
     api.find_aot_image = pointer<decltype(api.find_aot_image)>(resolve(profile::FindAotImage));
     for (size_t i = 0; i < profile::EvidenceCount; ++i) {
@@ -186,6 +212,63 @@ Api bind_api(const Config& config, const Memory& memory, const Module& module, s
 void refresh(Memory& memory) {
     std::string error;
     if (!memory.refresh(error)) throw std::runtime_error(error);
+}
+
+void append_evidence(Report& report, const std::vector<DiscoveryEvidence>& evidence) {
+    for (const auto& entry : evidence) {
+        auto found = std::find_if(report.discovery_evidence.begin(), report.discovery_evidence.end(),
+            [&](const DiscoveryEvidence& previous) { return previous.address == entry.address && previous.length == entry.length; });
+        if (found == report.discovery_evidence.end()) report.discovery_evidence.push_back(entry);
+        else if (found->sha256 != entry.sha256) throw std::runtime_error("Semantic discovery evidence changed between objects");
+    }
+}
+
+bool audit_auto_evidence(const Report& report, const Memory& memory, const std::atomic<bool>& cancelled) {
+    check_cancel(cancelled);
+    bool unchanged = true;
+    for (const auto& evidence : report.discovery_evidence) {
+        check_cancel(cancelled);
+        std::vector<uint8_t> bytes(evidence.length);
+        if (!memory.read(evidence.address, bytes.data(), bytes.size()) || sha256(bytes.data(), bytes.size()) != evidence.sha256)
+            unchanged = false;
+    }
+    for (const auto& binding : report.bindings) {
+        check_cancel(cancelled);
+        std::vector<uint8_t> bytes(binding.length);
+        if (!memory.read(binding.address, bytes.data(), bytes.size()) || sha256(bytes.data(), bytes.size()) != binding.actual_hash)
+            unchanged = false;
+    }
+    check_cancel(cancelled);
+    return unchanged;
+}
+
+void initialize_auto_profile(Config& config, Api& api, Memory& memory, Report& report,
+                             std::chrono::steady_clock::time_point deadline, const std::atomic<bool>& cancelled) {
+    uintptr_t entry = 0;
+    while (!(entry = address(api.resolve_icall("HybridCLR.RuntimeApi::PreJitClass(System.Type)")))) {
+        check_cancel(cancelled);
+        if (std::chrono::steady_clock::now() >= deadline) throw std::runtime_error("HybridCLR PreJitClass icall readiness timeout");
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+    refresh(memory);
+    RegistryDiscovery found;
+    std::string error;
+    if (!discover_registries(memory, report.module, entry, found, error))
+        throw std::runtime_error("Unsupported auto registry discovery: " + error);
+    append_evidence(report, found.evidence);
+    config.profile.hot_registry_rva = found.hot_registry - report.module.bias;
+    config.profile.aot_vector_rva = found.aot_vector - report.module.bias;
+    auto& layout = config.profile.layout;
+    layout.il2cpp_image_token = found.image_token;
+    layout.il2cpp_image_assembly = found.image_assembly;
+    layout.aot_target_assembly = found.aot_target_assembly;
+    std::vector<DiscoveryEvidence> getters;
+    if (!discover_pointer_getter(memory, report.module, address(api.assembly_image), layout.assembly_image, getters, error) ||
+        !discover_pointer_getter(memory, report.module, address(api.image_name), layout.il2cpp_image_name, getters, error))
+        throw std::runtime_error("Unsupported auto identity getter: " + error);
+    append_evidence(report, getters);
+    log("Semantic discovery: hot=%s, aot=%s; no private queries or configured RVAs",
+        pointer_text(config.profile.hot_registry_rva).c_str(), pointer_text(config.profile.aot_vector_rva).c_str());
 }
 
 Registries registry_snapshot(Memory& memory, const Module& module, const Config& config) {
@@ -216,16 +299,16 @@ std::string image_name(Api& api, const Memory& memory, uintptr_t image) {
 }
 
 bool verify_hot(const Memory& memory, uintptr_t hybrid, uintptr_t image, uint32_t slot,
-                uintptr_t assembly, const profile::Layout& layout, std::string& error) {
+                uintptr_t assembly, const profile::Layout& layout, bool automatic, std::string& error) {
     uintptr_t associated = 0, owner = 0, assembly_image = 0;
     uint32_t index = 0, token = 0, assembly_token = 0;
     if (!hybrid || !image || !assembly || slot == 0 || slot >= profile::kHotSlots ||
         !memory.value(hybrid + layout.hot_il2cpp_image, associated) ||
-        !memory.value(hybrid + layout.hot_index, index) ||
+        (!automatic && (!memory.value(hybrid + layout.hot_index, index) || index != slot)) ||
         !memory.value(image + layout.il2cpp_image_token, token) ||
         !memory.value(image + layout.il2cpp_image_assembly, owner) ||
-        !memory.value(assembly + layout.assembly_token, assembly_token) || !assembly_token ||
-        !memory.value(assembly, assembly_image) || !same_pointer(associated, image) || index != slot ||
+        (!automatic && (!memory.value(assembly + layout.assembly_token, assembly_token) || !assembly_token)) ||
+        !memory.value(assembly + layout.assembly_image, assembly_image) || !same_pointer(associated, image) ||
         !profile::interpreter_token(token) || profile::image_index(token) != slot ||
         !same_pointer(owner, assembly) || !same_pointer(assembly_image, image)) {
         error = "Hot image/token/registry slot/assembly association mismatch";
@@ -235,19 +318,41 @@ bool verify_hot(const Memory& memory, uintptr_t hybrid, uintptr_t image, uint32_
 }
 
 bool verify_aot(const Memory& memory, uintptr_t hybrid, uintptr_t assembly, uintptr_t image,
-                const profile::Layout& layout, std::string& error) {
+                const profile::Layout& layout, bool automatic, std::string& error) {
     uintptr_t target = 0, associated = 0, owner = 0;
     uint32_t token = UINT32_MAX, assembly_token = 0;
     if (!hybrid || !assembly || !image ||
         !memory.value(hybrid + layout.aot_target_assembly, target) || !same_pointer(target, assembly) ||
-        !memory.value(assembly + layout.assembly_token, assembly_token) || !assembly_token ||
-        !memory.value(assembly, associated) || !same_pointer(associated, image) ||
+        (!automatic && (!memory.value(assembly + layout.assembly_token, assembly_token) || !assembly_token)) ||
+        !memory.value(assembly + layout.assembly_image, associated) || !same_pointer(associated, image) ||
         !memory.value(image + layout.il2cpp_image_assembly, owner) || !same_pointer(owner, assembly) ||
         !memory.value(image + layout.il2cpp_image_token, token) || profile::interpreter_token(token)) {
         error = "AOT supplementary image/target assembly association mismatch";
         return false;
     }
     return true;
+}
+
+void auto_hot_association(Candidate& candidate, const Memory& memory) {
+    size_t matches = 0;
+    for (size_t offset = sizeof(uintptr_t); offset < profile::kImageAssociationBytes; offset += sizeof(uintptr_t)) {
+        uintptr_t image = 0, assembly = 0;
+        uint32_t token = 0;
+        if (!memory.value(candidate.hybrid_image + offset, image) || !image ||
+            !memory.value(image + candidate.layout.il2cpp_image_token, token) ||
+            !profile::interpreter_token(token) || profile::image_index(token) != candidate.registry_index ||
+            !memory.value(image + candidate.layout.il2cpp_image_assembly, assembly)) continue;
+        auto layout = candidate.layout;
+        layout.hot_il2cpp_image = offset;
+        std::string error;
+        if (!verify_hot(memory, candidate.hybrid_image, image, candidate.registry_index, assembly, layout, true, error)) continue;
+        ++matches;
+        candidate.il2cpp_image = image;
+        candidate.assembly = assembly;
+        candidate.layout.hot_il2cpp_image = offset;
+    }
+    if (matches != 1) throw std::runtime_error(matches ? "Ambiguous hot native image back-pointers" :
+        "No supported hot image/assembly association in bounded object prefix");
 }
 
 uintptr_t representative_method(Api& api, Memory& memory, uintptr_t image,
@@ -300,7 +405,6 @@ Candidate& add_candidate(Report& report, std::map<uintptr_t, size_t>& indices, u
 void discover(Report& report, Api& api, Memory& memory, const Config& config,
               const std::atomic<bool>& cancelled) {
     std::map<uintptr_t, size_t> indices;
-    const auto& layout = config.profile.layout;
     // Record the complete registry union before any per-image runtime query.
     for (size_t slot = 0; slot < report.before.hot.size(); ++slot) {
         uintptr_t hybrid = report.before.hot[slot];
@@ -336,39 +440,60 @@ void discover(Report& report, Api& api, Memory& memory, const Config& config,
         if (!candidate.error.empty()) continue;
         try {
             refresh(memory);
+            candidate.layout = config.profile.layout;
+            const auto& layout = candidate.layout;
             bool hot = candidate.kind == "HOT_UPDATE";
             if (hot) {
-                if (!memory.value(candidate.hybrid_image + layout.hot_il2cpp_image, candidate.il2cpp_image) ||
+                if (config.automatic_discovery) auto_hot_association(candidate, memory);
+                else if (!memory.value(candidate.hybrid_image + layout.hot_il2cpp_image, candidate.il2cpp_image) ||
                     !candidate.il2cpp_image ||
                     !memory.value(candidate.il2cpp_image + layout.il2cpp_image_assembly, candidate.assembly))
                     throw std::runtime_error("Unreadable registered hot image/assembly association");
                 candidate.association_verified = verify_hot(memory, candidate.hybrid_image, candidate.il2cpp_image,
-                    candidate.registry_index, candidate.assembly, layout, candidate.error);
+                    candidate.registry_index, candidate.assembly, layout, config.automatic_discovery, candidate.error);
             } else {
                 if (!memory.value(candidate.hybrid_image + layout.aot_target_assembly, candidate.assembly) ||
-                    !candidate.assembly || !memory.value(candidate.assembly, candidate.il2cpp_image))
+                    !candidate.assembly || !memory.value(candidate.assembly + layout.assembly_image, candidate.il2cpp_image))
                     throw std::runtime_error("Unreadable registered AOT target assembly/image");
                 candidate.association_verified = verify_aot(memory, candidate.hybrid_image, candidate.assembly,
-                    candidate.il2cpp_image, layout, candidate.error);
+                    candidate.il2cpp_image, layout, config.automatic_discovery, candidate.error);
             }
             if (!candidate.association_verified) continue;
+            if (config.automatic_discovery) {
+                uintptr_t name = 0;
+                std::string text;
+                if (!memory.value(candidate.il2cpp_image + layout.il2cpp_image_name, name) ||
+                    !memory.read_string(name, text) || text.empty())
+                    throw std::runtime_error("Unreadable native name before public identity getter calls");
+            }
             uintptr_t image = address(api.assembly_image(pointer<const Il2CppAssembly*>(candidate.assembly)));
             if (!same_pointer(image, candidate.il2cpp_image))
                 throw std::runtime_error("assembly_get_image disagrees with the registry association");
             candidate.name = image_name(api, memory, image);
-            if (hot) {
+            if (config.automatic_discovery) {
+                candidate.association_route = "SEMANTIC_REGISTRY_PUBLIC_API";
+                candidate.sources.push_back("PUBLIC_API_REGISTRY_ASSOCIATION");
+            } else if (hot) {
                 candidate.method = representative_method(api, memory, image, layout, cancelled);
                 if (candidate.method) {
                     uintptr_t underlying = address(api.underlying_image(pointer<const MethodInfo*>(candidate.method)));
                     if (!same_pointer(underlying, candidate.hybrid_image))
                         throw std::runtime_error("Underlying-image query disagrees with the registered hot image");
                     candidate.sources.push_back("GET_UNDERLYING_IMAGE_BY_METHOD");
-                } else candidate.sources.push_back("TOKEN_REGISTRY_FALLBACK_NO_METHOD");
+                    candidate.association_route = "PROFILE_PRIVATE_QUERY";
+                    candidate.private_query_status = "MATCH";
+                } else {
+                    candidate.sources.push_back("TOKEN_REGISTRY_FALLBACK_NO_METHOD");
+                    candidate.association_route = "PROFILE_TOKEN_REGISTRY_NO_METHOD";
+                    candidate.private_query_status = "NOT_RUN_NO_METHOD";
+                }
             } else {
                 uintptr_t supplementary = address(api.find_aot_image(pointer<const Il2CppAssembly*>(candidate.assembly)));
                 if (!same_pointer(supplementary, candidate.hybrid_image))
                     throw std::runtime_error("FindImageByAssembly disagrees with the registered AOT image");
                 candidate.sources.push_back("FIND_AOT_BY_ASSEMBLY");
+                candidate.association_route = "PROFILE_PRIVATE_QUERY";
+                candidate.private_query_status = "MATCH";
             }
             candidate.query_confirmed = true;
         } catch (const Cancelled&) { throw; }
@@ -394,6 +519,65 @@ bool raw_descriptor(const Memory& memory, uintptr_t object, uint64_t limit, cons
     return true;
 }
 
+bool auto_raw_field(Candidate& candidate, bool pdb, Report& report,
+                    Memory& memory, uintptr_t& raw_object, profile::Layout& selected_layout, std::string& error) {
+    size_t matches = 0;
+    std::vector<DiscoveryEvidence> selected_evidence;
+    for (size_t offset = sizeof(uintptr_t); offset < profile::kRawOwnerBytes; offset += sizeof(uintptr_t)) {
+        uintptr_t object = 0;
+        if (!memory.value(candidate.hybrid_image + offset, object) || !object) continue;
+        auto layout = candidate.layout;
+        std::vector<DiscoveryEvidence> evidence;
+        std::string reason;
+        if (!discover_raw_layout(memory, report.module, object, layout, evidence, reason)) {
+            if (reason == "Ambiguous raw loader methods" || reason == "Overlapping raw loader fields" ||
+                reason == "Unsupported or incomplete raw loader store prefix") {
+                error = "Unsupported raw-like owner: " + reason;
+                return false;
+            }
+            continue;
+        }
+        Raw raw;
+        // Capture policy must not filter an otherwise real owner into false uniqueness.
+        if (!raw_descriptor(memory, object, UINT32_MAX, layout, raw, reason)) {
+            error = "Invalid discovered raw descriptor: " + reason;
+            return false;
+        }
+        uint32_t magic = 0;
+        if (!memory.value(raw.data, magic)) { error = "Discovered raw header became unreadable"; return false; }
+        if (magic != 0x424a5342u && (magic & 0xffffu) != 0x5a4du) {
+            error = "Unknown format in a discovered raw owner; cannot certify unique DLL/PDB ownership";
+            return false;
+        }
+        if (pdb) {
+            if (magic != 0x424a5342u) continue;
+            layout.image_pdb = offset;
+        } else {
+            uint32_t pe_offset = 0, signature = 0;
+            if (magic == 0x424a5342u) continue;
+            if (raw.length < 64 ||
+                !memory.value(raw.data + 0x3c, pe_offset) || pe_offset > raw.length - 4 ||
+                !memory.value(raw.data + pe_offset, signature) || signature != 0x00004550u) {
+                error = "Invalid PE header in a discovered DLL raw owner";
+                return false;
+            }
+            layout.image_raw = offset;
+        }
+        ++matches;
+        raw_object = object;
+        selected_layout = layout;
+        selected_evidence = std::move(evidence);
+    }
+    if (matches != 1) {
+        error = matches ? "Ambiguous retained raw owners in bounded Image prefix" :
+            "No positively identified raw owner in bounded Image prefix; absence is not certified";
+        return false;
+    }
+    append_evidence(report, selected_evidence);
+    candidate.sources.push_back(pdb ? "SEMANTIC_PDB_LOADER_AND_RAW_OWNER" : "SEMANTIC_DLL_LOADER_AND_RAW_OWNER");
+    return true;
+}
+
 std::string safe_name(const std::string& name) {
     std::string result;
     for (unsigned char c : name) {
@@ -411,11 +595,12 @@ struct FileDescriptor {
 };
 
 void dump_blob(Blob& blob, uintptr_t raw_object, uintptr_t owner_slot, bool pdb,
-               const std::string& basename, const Config& config, Report& report, Memory& memory,
+               const std::string& basename, const profile::Layout& layout, const Config& config, Report& report, Memory& memory,
                const std::atomic<bool>& cancelled) {
     blob.status = "PARTIAL";
+    blob.layout = layout;
     refresh(memory);
-    if (!raw_descriptor(memory, raw_object, config.max_file_size, config.profile.layout, blob.raw, blob.reason)) return;
+    if (!raw_descriptor(memory, raw_object, config.max_file_size, layout, blob.raw, blob.reason)) return;
     blob.filename = basename + (pdb ? ".pdb.partial" : ".dll.partial");
     std::string path = report.directory + '/' + blob.filename;
     FileDescriptor output{::open(path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600)};
@@ -459,7 +644,7 @@ void dump_blob(Blob& blob, uintptr_t raw_object, uintptr_t owner_slot, bool pdb,
     Raw after;
     uintptr_t retained_object = 0;
     if (!memory.value(owner_slot, retained_object) || !same_pointer(retained_object, raw_object) ||
-        !raw_descriptor(memory, raw_object, config.max_file_size, config.profile.layout, after, blob.reason) || !(blob.raw == after)) {
+        !raw_descriptor(memory, raw_object, config.max_file_size, layout, after, blob.reason) || !(blob.raw == after)) {
         blob.reason = "Raw descriptor or owning Image field changed while copying";
         return;
     }
@@ -486,7 +671,6 @@ void dump_blob(Blob& blob, uintptr_t raw_object, uintptr_t owner_slot, bool pdb,
 
 void capture(Report& report, const Config& config, Memory& memory, const std::atomic<bool>& cancelled) {
     std::map<std::string, size_t> identities;
-    const auto& layout = config.profile.layout;
     for (auto& candidate : report.candidates) {
         check_cancel(cancelled);
         if (!candidate.error.empty() || !candidate.association_verified || !candidate.query_confirmed) {
@@ -495,36 +679,58 @@ void capture(Report& report, const Config& config, Memory& memory, const std::at
             candidate.dll.reason = candidate.error.empty() ? "Image association/query is not verified" : candidate.error;
             continue;
         }
+        auto& layout = candidate.layout;
         uintptr_t raw = 0;
-        if (!memory.value(candidate.hybrid_image + layout.image_raw, raw) || !raw) {
+        bool retained = config.automatic_discovery ?
+            auto_raw_field(candidate, false, report, memory, raw, layout, candidate.error) :
+            memory.value(candidate.hybrid_image + layout.image_raw, raw) && raw;
+        if (!retained) {
             candidate.status = "PENDING_INITIALIZATION";
             candidate.dll.status = "PENDING_INITIALIZATION";
-            candidate.dll.reason = "Registered image has no readable retained RawImageBase";
+            candidate.dll.reason = candidate.error.empty() ? "Registered image has no readable retained RawImageBase" : candidate.error;
             continue;
         }
         std::string basename = candidate.kind == "HOT_UPDATE" ? "hot_" : "aot_";
         basename += std::to_string(candidate.id) + '_' + safe_name(candidate.name);
         if (basename.size() >= 4 && basename.substr(basename.size() - 4) == ".dll") basename.resize(basename.size() - 4);
         dump_blob(candidate.dll, raw, candidate.hybrid_image + layout.image_raw, false,
-                  basename, config, report, memory, cancelled);
+                  basename, layout, config, report, memory, cancelled);
         if (candidate.dll.status == "COMPLETE") {
-            candidate.status = candidate.kind == "HOT_UPDATE" ? "HOT_UPDATE_COMPLETE" : "AOT_SUPPLEMENT_COMPLETE";
+            std::string native_name = candidate.name;
+            if (native_name.size() >= 4) {
+                std::string suffix = native_name.substr(native_name.size() - 4);
+                for (char& c : suffix) if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+                if (suffix == ".dll") native_name.resize(native_name.size() - 4);
+            }
+            candidate.native_name_matches_metadata = native_name == candidate.dll.format.assembly_name;
+            if (!candidate.native_name_matches_metadata) {
+                candidate.error = "Native image name disagrees with retained DLL Assembly identity";
+                candidate.status = "PARTIAL";
+            } else {
+                candidate.status = candidate.kind == "HOT_UPDATE" ? "HOT_UPDATE_COMPLETE" : "AOT_SUPPLEMENT_COMPLETE";
+            }
             std::string identity = candidate.dll.format.mvid + ':' + candidate.dll.output_hash;
             auto duplicate = identities.emplace(identity, candidate.id);
             if (!duplicate.second) candidate.duplicate_of = duplicate.first->second;
         } else candidate.status = candidate.dll.status;
 
+        log("Capture %zu: %s, %s, %llu/%u bytes", candidate.id, candidate.kind.c_str(),
+            candidate.status.c_str(), static_cast<unsigned long long>(candidate.dll.written), candidate.dll.raw.length);
         if (!config.dump_pdb) { candidate.pdb.status = "DISABLED"; continue; }
         check_cancel(cancelled);
         uintptr_t pdb = 0;
-        if (!memory.value(candidate.hybrid_image + layout.image_pdb, pdb)) {
+        auto pdb_layout = layout;
+        if (config.automatic_discovery) {
+            if (!auto_raw_field(candidate, true, report, memory, pdb, pdb_layout, candidate.pdb.reason)) {
+                candidate.pdb.status = "NOT_DISCOVERED";
+            } else dump_blob(candidate.pdb, pdb, candidate.hybrid_image + pdb_layout.image_pdb, true,
+                            basename, pdb_layout, config, report, memory, cancelled);
+        } else if (!memory.value(candidate.hybrid_image + layout.image_pdb, pdb)) {
             candidate.pdb.status = "PARTIAL";
             candidate.pdb.reason = "Unreadable Image::_pdbImage field";
         } else if (!pdb) candidate.pdb.status = "NOT_PRESENT";
         else dump_blob(candidate.pdb, pdb, candidate.hybrid_image + layout.image_pdb, true,
-                       basename, config, report, memory, cancelled);
-        log("Capture %zu: %s, %s, %llu/%u bytes", candidate.id, candidate.kind.c_str(),
-            candidate.status.c_str(), static_cast<unsigned long long>(candidate.dll.written), candidate.dll.raw.length);
+                       basename, layout, config, report, memory, cancelled);
     }
 }
 
@@ -541,7 +747,9 @@ void emit_blob(std::ostream& out, const Blob& blob) {
         << ",\"second_live_pass_sha256\":" << json_string(blob.live_hash)
         << ",\"format_valid\":" << (blob.format.valid ? "true" : "false")
         << ",\"assembly_name_from_metadata\":" << json_string(blob.format.assembly_name)
-        << ",\"mvid\":" << json_string(blob.format.mvid) << ",\"chunks\":[";
+        << ",\"mvid\":" << json_string(blob.format.mvid)
+        << ",\"raw_layout\":{\"data\":" << blob.layout.raw_data << ",\"length\":" << blob.layout.raw_length
+        << ",\"end\":" << blob.layout.raw_end << "},\"chunks\":[";
     for (size_t i = 0; i < blob.chunks.size(); ++i) {
         if (i) out << ',';
         const auto& chunk = blob.chunks[i];
@@ -560,7 +768,10 @@ bool write_manifest(const Report& report, const Config& config, std::string& err
         if (entry.dll.status == "COMPLETE") ++complete_files;
         if (entry.association_verified) associated_assemblies.insert(untag(entry.assembly));
     }
-    out << "{\n\"schema_version\":2,\n\"profile\":" << json_string(config.profile.name)
+    out << "{\n\"schema_version\":3,\n\"profile\":" << json_string(config.profile.name)
+        << ",\n\"discovery_mode\":" << json_string(config.automatic_discovery ? "auto" : "profile")
+        << ",\n\"supported_registry_abi\":\"ARM64_METADATA_V2_1024_HOT_THREE_POINTER_AOT_VECTOR\""
+        << ",\n\"payload_copy\":\"FAILURE_REPORTING_KERNEL_READ\""
         << ",\n\"configuration_path\":" << json_string(config.config_path)
         << ",\n\"configuration_sha256\":" << json_string(config.config_sha256)
         << ",\n\"analysis_idb_sha256\":" << json_string(config.profile.analysis_sha256)
@@ -573,12 +784,22 @@ bool write_manifest(const Report& report, const Config& config, std::string& err
         << ",\n\"discovery_source\":\"HYBRIDCLR_REGISTRY_UNION\""
         << ",\n\"all_process_assemblies_enumerated\":false"
         << ",\n\"ordinary_aot_without_raw_enumerated\":false"
+        << ",\n\"resolved_registry_rvas\":{\"hot\":" << json_string(pointer_text(config.profile.hot_registry_rva))
+        << ",\"aot_vector\":" << json_string(pointer_text(config.profile.aot_vector_rva)) << '}'
+        << ",\n\"resolved_identity_layout\":{\"image_token\":" << config.profile.layout.il2cpp_image_token
+        << ",\"image_assembly\":" << config.profile.layout.il2cpp_image_assembly
+        << ",\"assembly_image\":" << config.profile.layout.assembly_image
+        << ",\"image_name\":" << config.profile.layout.il2cpp_image_name
+        << ",\"aot_target_assembly\":" << config.profile.layout.aot_target_assembly << '}'
+        << ",\n\"semantic_evidence_unchanged\":" << (report.discovery_evidence_unchanged ? "true" : "false")
         << ",\n\"stable_window_confirmed_by_caller\":" << (config.stable_window_confirmed ? "true" : "false")
+        << ",\n\"experimental_ungated_capture\":" << (!config.stable_window_confirmed ? "true" : "false")
         << ",\n\"unchanged_reads_are_not_a_lifetime_gate\":true"
         << ",\n\"validation_scope\":[\"PE/CLI headers\",\"metadata streams and table bounds\",\"Module MVID and Assembly name\"]"
         << ",\n\"all_IL_and_EH_verified\":false,\n\"registry_snapshot_taken\":"
         << (report.registry_snapshot_taken ? "true" : "false")
         << ",\n\"registry_snapshots_unchanged\":" << (report.snapshot_unchanged ? "true" : "false")
+        << ",\n\"all_registered_inputs_exported\":" << (report.all_registered_inputs_exported ? "true" : "false")
         << ",\n\"complete_within_declared_scope\":" << (report.complete ? "true" : "false")
         << ",\n\"result_code\":" << report.result << ",\n\"cancelled\":" << (report.cancelled ? "true" : "false")
         << ",\n\"error\":" << json_string(report.error)
@@ -595,6 +816,13 @@ bool write_manifest(const Report& report, const Config& config, std::string& err
             << ",\"expected_sha256\":" << json_string(binding.expected_hash)
             << ",\"actual_sha256\":" << json_string(binding.actual_hash) << '}';
     }
+    out << "\n],\n\"semantic_discovery_evidence\":[";
+    for (size_t i = 0; i < report.discovery_evidence.size(); ++i) {
+        if (i) out << ',';
+        const auto& evidence = report.discovery_evidence[i];
+        out << "\n{\"name\":" << json_string(evidence.name) << ",\"address\":" << json_string(pointer_text(evidence.address))
+            << ",\"length\":" << evidence.length << ",\"sha256\":" << json_string(evidence.sha256) << '}';
+    }
     out << "\n],\n\"captures\":[";
     for (size_t i = 0; i < report.candidates.size(); ++i) {
         if (i) out << ',';
@@ -609,6 +837,11 @@ bool write_manifest(const Report& report, const Config& config, std::string& err
             << ",\"registry_index\":";
         if (entry.registry_index == UINT32_MAX) out << "null"; else out << entry.registry_index;
         out << ",\"query_confirmed\":" << (entry.query_confirmed ? "true" : "false")
+            << ",\"association_route\":" << json_string(entry.association_route)
+            << ",\"private_query_status\":" << json_string(entry.private_query_status)
+            << ",\"native_name_matches_metadata\":" << (entry.native_name_matches_metadata ? "true" : "false")
+            << ",\"resolved_owner_layout\":{\"hot_il2cpp_image\":" << entry.layout.hot_il2cpp_image
+            << ",\"image_raw\":" << entry.layout.image_raw << ",\"image_pdb\":" << entry.pdb.layout.image_pdb << '}'
             << ",\"registered\":" << (entry.registered ? "true" : "false")
             << ",\"association_verified\":" << (entry.association_verified ? "true" : "false")
             << ",\"duplicate_of_capture_id\":" << entry.duplicate_of << ",\"sources\":[";
@@ -642,7 +875,8 @@ bool write_manifest(const Report& report, const Config& config, std::string& err
 
 } // namespace
 
-int dump_runtime(const Config& config, const std::atomic<bool>& cancelled) {
+int dump_runtime(const Config& requested_config, const std::atomic<bool>& cancelled) {
+    Config config = requested_config;
     Report report;
     try {
         std::string error;
@@ -683,6 +917,7 @@ int dump_runtime(const Config& config, const std::atomic<bool>& cancelled) {
             attached.owned = attached.thread != nullptr;
             if (!attached.thread) throw std::runtime_error("il2cpp_thread_attach returned null");
         }
+        if (config.automatic_discovery) initialize_auto_profile(config, api, memory, report, deadline, cancelled);
         report.before = registry_snapshot(memory, report.module, config);
         report.registry_snapshot_taken = true;
         discover(report, api, memory, config, cancelled);
@@ -691,22 +926,34 @@ int dump_runtime(const Config& config, const std::atomic<bool>& cancelled) {
         Registries after = registry_snapshot(memory, report.module, config);
         report.snapshot_unchanged = report.before == after;
         if (!report.snapshot_unchanged) report.error = "Registry snapshot changed; not a coherent stable capture";
-        report.complete = report.snapshot_unchanged;
+        report.all_registered_inputs_exported = report.snapshot_unchanged;
+        if (report.candidates.empty()) {
+            report.error = "No registered retained inputs discovered; confirm the loading stage";
+            report.all_registered_inputs_exported = false;
+        }
         for (auto& candidate : report.candidates) {
             std::string mismatch;
             bool associated = candidate.kind == "HOT_UPDATE" ?
                 verify_hot(memory, candidate.hybrid_image, candidate.il2cpp_image, candidate.registry_index,
-                           candidate.assembly, config.profile.layout, mismatch) :
+                           candidate.assembly, candidate.layout, config.automatic_discovery, mismatch) :
                 verify_aot(memory, candidate.hybrid_image, candidate.assembly, candidate.il2cpp_image,
-                           config.profile.layout, mismatch);
+                           candidate.layout, config.automatic_discovery, mismatch);
             if (!associated) {
                 if (candidate.error.empty()) candidate.error = mismatch;
                 if (candidate.query_confirmed) candidate.status = "PARTIAL";
             }
             bool dll_ok = candidate.status == "HOT_UPDATE_COMPLETE" || candidate.status == "AOT_SUPPLEMENT_COMPLETE";
             bool pdb_ok = !config.dump_pdb || candidate.pdb.status == "NOT_PRESENT" || candidate.pdb.status == "COMPLETE";
-            if (!dll_ok || !pdb_ok || !candidate.error.empty()) report.complete = false;
+            if (!dll_ok || !pdb_ok || !candidate.error.empty()) report.all_registered_inputs_exported = false;
         }
+        if (config.automatic_discovery) {
+            report.discovery_evidence_unchanged = audit_auto_evidence(report, memory, cancelled);
+            if (!report.discovery_evidence_unchanged) {
+                report.error = "Semantic discovery code/GOT/vtable evidence changed during capture";
+                report.all_registered_inputs_exported = false;
+            }
+        }
+        report.complete = config.stable_window_confirmed && report.all_registered_inputs_exported;
         report.result = report.complete ? HYBRIDCLR_DUMP_OK : HYBRIDCLR_DUMP_INCOMPLETE;
     } catch (const Cancelled&) {
         report.cancelled = true;

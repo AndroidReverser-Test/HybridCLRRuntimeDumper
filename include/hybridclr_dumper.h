@@ -15,7 +15,7 @@ typedef struct HybridClrDumpOptions {
     uint32_t abi_version;
     /* All settings and target function RVAs are read from this absolute path. */
     const char* config_path;
-    /* The caller must keep a real loading/lifetime gate held until completion. */
+    /* 1: keep a real gate held until completion. 0: requires experimental config opt-in. */
     uint32_t stable_window_confirmed;
 } HybridClrDumpOptions;
 

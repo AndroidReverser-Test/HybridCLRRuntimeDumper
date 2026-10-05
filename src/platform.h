@@ -25,6 +25,8 @@ struct Config {
     std::string output_directory;
     std::string module_name = "libil2cpp.so";
     bool stable_window_confirmed = false;
+    bool allow_ungated_capture = false;
+    bool automatic_discovery = false;
     bool dump_pdb = true;
     uint32_t chunk_size = 256 * 1024;
     uint32_t initialization_timeout_seconds = 30;
@@ -49,7 +51,7 @@ public:
     bool executable(uintptr_t address, size_t size) const;
     /* Failure-reporting reads for descriptors; no direct dereference on failure. */
     bool read(uintptr_t address, void* out, size_t size) const;
-    /* Retains the original Android pointer tag when calling libc memcpy. */
+    /* Failure-reporting kernel reads, also for payloads; no unsafe memcpy. */
     bool copy_payload(uintptr_t address, void* out, size_t size) const;
     bool read_string(uintptr_t address, std::string& out, size_t limit = 1024) const;
     template<typename T> bool value(uintptr_t address, T& out) const {

@@ -126,26 +126,28 @@ bool load_config(const std::string& path, Config& config, std::string& error) {
                     "Configuration size changed while reading");
     }
 
-    std::set<std::string> required = {
+    std::set<std::string> profile_required = {
         "stable_window_confirmed", "profile.name", "registry.hot.rva", "registry.aot_vector.rva"
     };
-    for (const auto& function : profile::kFunctions) {
-        const std::string prefix = std::string("function.") + function.name;
-        required.insert(prefix + ".rva");
-        required.insert(prefix + ".fingerprint_length");
-        required.insert(prefix + ".sha256");
+    for (size_t i = 0; i < profile::ResolveIcall; ++i) {
+        const std::string prefix = std::string("function.") + profile::kFunctions[i].name;
+        profile_required.insert(prefix + ".rva");
+        profile_required.insert(prefix + ".fingerprint_length");
+        profile_required.insert(prefix + ".sha256");
     }
     for (const char* name : profile::kEvidenceNames) {
         const std::string prefix = std::string("evidence.") + name;
-        required.insert(prefix + ".rva");
-        required.insert(prefix + ".bytes_hex");
+        profile_required.insert(prefix + ".rva");
+        profile_required.insert(prefix + ".bytes_hex");
     }
     for (const auto& layout : profile::kLayouts) {
-        required.insert(std::string("layout.") + layout.name);
+        if (layout.member != &profile::Layout::assembly_image)
+            profile_required.insert(std::string("layout.") + layout.name);
     }
-    std::set<std::string> allowed = required;
+    std::set<std::string> allowed = profile_required;
     allowed.insert({"profile.analysis_sha256", "module_name", "initialization_timeout_seconds",
-                    "chunk_size", "max_file_size", "dump_pdb", "output_directory"});
+                    "chunk_size", "max_file_size", "dump_pdb", "output_directory", "allow_ungated_capture",
+                    "discovery_mode", "layout.assembly_image"});
     std::map<std::string, std::string_view> values;
     size_t offset = 0;
     size_t line_number = 0;
@@ -183,7 +185,22 @@ bool load_config(const std::string& path, Config& config, std::string& error) {
             return fail(context + "duplicate key: " + key);
         }
     }
-    // Presence, not a nonzero value, proves that even zero-valued layouts were supplied.
+    bool automatic = false;
+    if (values.count("discovery_mode")) {
+        const auto mode = values.at("discovery_mode");
+        if (mode != "auto" && mode != "profile") return fail("discovery_mode must be auto or profile");
+        automatic = mode == "auto";
+    }
+    if (automatic) {
+        for (const auto& entry : values) {
+            if (entry.first.compare(0, 9, "function.") == 0 || entry.first.compare(0, 9, "registry.") == 0 ||
+                entry.first.compare(0, 7, "layout.") == 0 || entry.first.compare(0, 9, "evidence.") == 0 ||
+                entry.first == "profile.analysis_sha256")
+                return fail("Auto discovery does not accept manual profile evidence or offsets: " + entry.first);
+        }
+    }
+    const std::set<std::string> required = automatic ? std::set<std::string>{"stable_window_confirmed"} : profile_required;
+    // Preserve existing shipped profiles, including their implicit Assembly image field at +0.
     for (const auto& key : required) {
         if (values.count(key) == 0) {
             return fail("Missing required configuration key: " + key);
@@ -218,10 +235,18 @@ bool load_config(const std::string& path, Config& config, std::string& error) {
     };
 
     Config parsed;
+    parsed.automatic_discovery = automatic;
     uint64_t number = 0;
-    if (!integer("stable_window_confirmed", 1, 1, 1, number)) return false;
-    parsed.stable_window_confirmed = true;
-    const std::string_view name = values.at("profile.name");
+    if (!integer("stable_window_confirmed", 0, 1, 1, number)) return false;
+    parsed.stable_window_confirmed = number == 1;
+    if (values.count("allow_ungated_capture") != 0) {
+        if (!integer("allow_ungated_capture", 0, 1, 1, number)) return false;
+        parsed.allow_ungated_capture = number == 1;
+    }
+    if (!parsed.stable_window_confirmed && !parsed.allow_ungated_capture) {
+        return fail("A real lifetime gate is required unless allow_ungated_capture=1 explicitly enables experimental testing");
+    }
+    const std::string_view name = values.count("profile.name") ? values.at("profile.name") : "arm64-semantic-metadata-v2";
     if (name.empty()) return fail("profile.name must be nonempty");
     parsed.profile.name.assign(name.data(), name.size());
     if (values.count("profile.analysis_sha256") != 0 &&
@@ -229,31 +254,32 @@ bool load_config(const std::string& path, Config& config, std::string& error) {
         return false;
     }
     const uint64_t max_rva = std::numeric_limits<uintptr_t>::max();
-    if (!integer("registry.hot.rva", 1, max_rva, 8, number)) return false;
-    parsed.profile.hot_registry_rva = static_cast<uintptr_t>(number);
-    if (!integer("registry.aot_vector.rva", 1, max_rva, 8, number)) return false;
-    parsed.profile.aot_vector_rva = static_cast<uintptr_t>(number);
-    for (size_t i = 0; i < profile::FunctionCount; ++i) {
-        const std::string prefix = std::string("function.") + profile::kFunctions[i].name;
-        auto& function = parsed.profile.functions[i];
-        if (!integer(prefix + ".rva", 1, max_rva, 4, number)) return false;
-        function.rva = static_cast<uintptr_t>(number);
-        if (!integer(prefix + ".fingerprint_length", 4, 4096, 4, number)) return false;
-        function.fingerprint_length = static_cast<size_t>(number);
-        if (!hex(prefix + ".sha256", 32, 32, 1, function.fingerprint_sha256)) return false;
-    }
-    for (size_t i = 0; i < profile::EvidenceCount; ++i) {
-        const std::string prefix = std::string("evidence.") + profile::kEvidenceNames[i];
-        auto& evidence = parsed.profile.evidence[i];
-        if (!integer(prefix + ".rva", 1, max_rva, 4, number)) return false;
-        evidence.rva = static_cast<uintptr_t>(number);
-        if (!hex(prefix + ".bytes_hex", 4, 1024, 4, evidence.bytes_hex)) return false;
-    }
-    for (const auto& layout : profile::kLayouts) {
-        if (!integer(std::string("layout.") + layout.name, 0, 65536, layout.alignment, number)) {
-            return false;
+    if (!automatic) {
+        if (!integer("registry.hot.rva", 1, max_rva, 8, number)) return false;
+        parsed.profile.hot_registry_rva = static_cast<uintptr_t>(number);
+        if (!integer("registry.aot_vector.rva", 1, max_rva, 8, number)) return false;
+        parsed.profile.aot_vector_rva = static_cast<uintptr_t>(number);
+        for (size_t i = 0; i < profile::ResolveIcall; ++i) {
+            const std::string prefix = std::string("function.") + profile::kFunctions[i].name;
+            auto& function = parsed.profile.functions[i];
+            if (!integer(prefix + ".rva", 1, max_rva, 4, number)) return false;
+            function.rva = static_cast<uintptr_t>(number);
+            if (!integer(prefix + ".fingerprint_length", 4, 4096, 4, number)) return false;
+            function.fingerprint_length = static_cast<size_t>(number);
+            if (!hex(prefix + ".sha256", 32, 32, 1, function.fingerprint_sha256)) return false;
         }
-        parsed.profile.layout.*layout.member = static_cast<size_t>(number);
+        for (size_t i = 0; i < profile::EvidenceCount; ++i) {
+            const std::string prefix = std::string("evidence.") + profile::kEvidenceNames[i];
+            auto& evidence = parsed.profile.evidence[i];
+            if (!integer(prefix + ".rva", 1, max_rva, 4, number)) return false;
+            evidence.rva = static_cast<uintptr_t>(number);
+            if (!hex(prefix + ".bytes_hex", 4, 1024, 4, evidence.bytes_hex)) return false;
+        }
+        for (const auto& layout : profile::kLayouts) {
+            if (layout.member == &profile::Layout::assembly_image && !values.count("layout.assembly_image")) continue;
+            if (!integer(std::string("layout.") + layout.name, 0, 65536, layout.alignment, number)) return false;
+            parsed.profile.layout.*layout.member = static_cast<size_t>(number);
+        }
     }
 
     if (values.count("module_name") != 0) {

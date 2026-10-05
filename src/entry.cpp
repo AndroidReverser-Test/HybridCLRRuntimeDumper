@@ -86,8 +86,8 @@ bool copy_options(const HybridClrDumpOptions* options, hcd::Config& config) {
         options->abi_version != HYBRIDCLR_DUMPER_ABI_VERSION) {
         return invalid_options("struct_size and abi_version must match exactly");
     }
-    if (options->stable_window_confirmed != 1) {
-        return invalid_options("stable_window_confirmed must be 1 under a real lifetime gate");
+    if (options->stable_window_confirmed > 1) {
+        return invalid_options("stable_window_confirmed must be 0 or 1");
     }
     if (!options->config_path || options->config_path[0] != '/') {
         return invalid_options("config_path must be a nonempty absolute path");
@@ -96,8 +96,8 @@ bool copy_options(const HybridClrDumpOptions* options, hcd::Config& config) {
     if (!hcd::load_config(options->config_path, config, error)) {
         return invalid_options(error.c_str());
     }
-    if (!config.stable_window_confirmed) {
-        return invalid_options("configuration stable_window_confirmed must also be 1");
+    if (config.stable_window_confirmed && options->stable_window_confirmed != 1) {
+        return invalid_options("the caller must confirm the configuration's lifetime gate");
     }
     return true;
 }
@@ -125,9 +125,13 @@ int enter_run(const HybridClrDumpOptions* options, bool asynchronous) noexcept {
         if (!copy_options(options, config)) {
             return finish_run(HYBRIDCLR_DUMP_INVALID_OPTIONS);
         }
-        hcd::log("Dump admitted: hold the application loading/lifetime gate until completion. "
-                 "Do not unload this SO while an API or worker is active; "
-                 "FINISHED is not a thread-join barrier.");
+        if (config.stable_window_confirmed) {
+            hcd::log("Dump admitted: hold the application loading/lifetime gate until completion.");
+        } else {
+            hcd::log("EXPERIMENTAL ungated capture: concurrent loading/freeing can crash the process. "
+                     "A complete stable snapshot cannot be certified; result will not be OK.");
+        }
+        hcd::log("Do not unload this SO while an API or worker is active; FINISHED is not a thread-join barrier.");
         if (asynchronous) {
             launch_worker([config = std::move(config)]() noexcept {
                 execute_run(config);

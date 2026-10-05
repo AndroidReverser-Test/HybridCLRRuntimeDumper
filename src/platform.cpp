@@ -180,9 +180,7 @@ bool Memory::read(uintptr_t address, void* out, size_t size) const {
 }
 
 bool Memory::copy_payload(uintptr_t address, void* out, size_t size) const {
-    if (!readable(address, size)) return false;
-    if (size) std::memcpy(out, reinterpret_cast<const void*>(address), size);
-    return true;
+    return read(address, out, size);
 }
 
 bool Memory::read_string(uintptr_t address, std::string& out, size_t limit) const {
@@ -328,8 +326,8 @@ uintptr_t Module::match_symbol(const Memory& memory, uint32_t index, const char*
         sym.st_shndx == SHN_UNDEF || sym.st_shndx >= SHN_LORESERVE || sym.st_name >= strsz_ ||
         ELF64_ST_TYPE(sym.st_info) != STT_FUNC ||
         (ELF64_ST_BIND(sym.st_info) != STB_GLOBAL && ELF64_ST_BIND(sym.st_info) != STB_WEAK) ||
-        (ELF64_ST_VISIBILITY(sym.st_other) != STV_DEFAULT &&
-         ELF64_ST_VISIBILITY(sym.st_other) != STV_PROTECTED)) return 0;
+        ((sym.st_other & 0x3u) != STV_DEFAULT &&
+         (sym.st_other & 0x3u) != STV_PROTECTED)) return 0;
     std::string candidate;
     size_t name_limit = std::min(strsz_ - sym.st_name, std::strlen(name) + 1);
     if (!memory.read_string(strtab_ + sym.st_name, candidate, name_limit) || candidate != name) return 0;
